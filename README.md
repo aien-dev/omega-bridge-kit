@@ -30,7 +30,9 @@ and `--fresh` to skip the conversion cache.
   `~/omega-work/.mac.lock`, the same lock `/usr/bin/lockf -k` uses.
 - **BROWSER**: the UI also instantiates the wasm module itself and shows that result as its own column.
 - `omb`, `ui/` and `remote/` are host infrastructure (CLI, UI, test harness) written in Python and sh.
-  They convert nothing.
+  They convert nothing. The UI serves only regular files whose real path lies inside the kit's
+  `samples/` or `picks/`; `python3 ui/test_file_containment.py` checks that `../` paths and symlinks
+  pointing outside are refused (no Spark needed).
 
 ## What is not claimed
 

@@ -28,14 +28,21 @@ LANG_EXT = {"c": ".c", "py": ".py", "om": ".om"}
 
 
 def source_files():
-    out = []
+    """Kit source files the UI may read: {relative path: resolved path}. A file is listed only if its
+    real path (symlinks resolved) is a regular file inside the kit's own samples/ or picks/ directory,
+    so a symlink, or a symlinked directory, that points outside is never offered or served."""
+    out = {}
+    root = os.path.realpath(KIT)
     for d in ("samples", "picks"):
+        base = os.path.join(root, d)
         p = os.path.join(KIT, d)
         if os.path.isdir(p):
             for f in sorted(os.listdir(p)):
                 ext = os.path.splitext(f)[1]
-                if ext in (".c", ".py", ".om"):
-                    out.append({"path": d + "/" + f, "lang": ext[1:]})
+                real = os.path.realpath(os.path.join(p, f))
+                if (ext in (".c", ".py", ".om") and os.path.commonpath([base, real]) == base
+                        and os.path.isfile(real)):
+                    out[d + "/" + f] = real
     return out
 
 
@@ -146,15 +153,17 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/api/info":
             pick = os.path.join(KIT, "picks", "PICK.md")
             return self.json(200, {"spark": omb.SPARK, "here": omb.HERE, "pins_sha": omb.PINS_SHA, "pins": omb.PINS,
-                                   "lifter": omb.lifter_status() or "ok", "files": source_files(), "forms": omb.FORMS,
+                                   "lifter": omb.lifter_status() or "ok",
+                                   "files": [{"path": k, "lang": os.path.splitext(k)[1][1:]} for k in source_files()],
+                                   "forms": omb.FORMS,
                                    "whats_real": whats_real(),
                                    "pick_md": open(pick, encoding="utf-8").read() if os.path.exists(pick) else ""})
         if self.path.startswith("/api/file?path="):
             rel = urllib.parse.unquote(self.path.split("=", 1)[1])
-            allowed = {f["path"] for f in source_files()}
-            if rel not in allowed:
+            real = source_files().get(rel)   # the path opened comes from the listing, never from the request
+            if real is None:
                 return self.json(404, {"error": "not a kit source file"})
-            with open(os.path.join(KIT, rel), "rb") as fh:
+            with open(real, "rb") as fh:
                 return self.json(200, {"path": rel, "lang": os.path.splitext(rel)[1][1:], "src": text(fh.read())})
         return self.json(404, {"error": "not found"})
 
