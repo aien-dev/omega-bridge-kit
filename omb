@@ -449,7 +449,8 @@ def native(om_text):
     last, which native.om exports as omega_F."""
     r = converge("native", "native-c", om_text)
     r["hex"] = {}
-    for m in re.finditer(r"ombr_code_(\w+):\\n\.byte ([0-9a-fx,]+)", r["out"].decode(errors="replace")):
+    # 358c5051 spelling: ombr_code_F:\n.byte ...; native-darwin spelling: OMBR_SYM(ombr_code_F) ":\n.byte ...
+    for m in re.finditer(r"ombr_code_(\w+)\)? ?\"?:\\n\.byte ([0-9a-fx,]+)", r["out"].decode(errors="replace")):
         r["hex"][m.group(1)] = "".join("%02x" % int(b, 16) for b in m.group(2).split(","))
     return r
 
