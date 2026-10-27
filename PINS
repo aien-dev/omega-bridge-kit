@@ -8,9 +8,10 @@ BOOT_OMC_SHA256=191b776ef98821597c3e30655da6d680a9b66edbc9ceaca3c39c61ea6df098e9
 TOC_OM_SHA256=e691e10d627b5595ee1268efb35222546eea9ba7b12805bb5bd98d565900c2c2
 BRIDGE_BIN_SHA256=db0847423bec99ba66fdd99e75e5e3b795e2a5386e81ca3ed7b4c9c530a5bd4e
 
-# aien-dev/omega-bridge src/native.om (native call ABI v1) at the commit whose C builds on macOS.
-NATIVE_SHA=358c505105793f202ad2b0c32a8623b606e029cd
-NATIVE_OM_SHA256=2c2c53f61d4ab302f1a2092c3c32189335dd53f6cf2b388f47a475f99f2c3940
+# aien-dev/omega-bridge src/native.om (native call ABI v1) at the commit whose C builds on macOS
+# (branch feat/native-darwin, draft PR #27; not merged).
+NATIVE_SHA=750020729bcd1471837007ff8b91f4e5e3cbd3e3
+NATIVE_OM_SHA256=a25abf0c6ef62bcc2c857aa901193c1b85d7459004d6c17e09c72cdbafeedd8e
 
 # Seeded compiler that compiles function-mode units for native.om (aien-spark/omega seed/out/omc).
 OMC734_REPO=https://github.com/aien-spark/omega.git

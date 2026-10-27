@@ -1200,7 +1200,7 @@ def verify(paths, quick, as_json):
     if as_json:
         emit({"verdict": verdict, "exit": worst, "spark": SPARK, "pins_sha256": PINS_SHA})
     else:
-        print("\nverify: %s (exit %d). Mac: %s; Spark steps via ssh %s; PINS sha256 %s" % (verdict, worst, host_name(), SPARK, PINS_SHA[:16]))
+        print("\nverify: %s (exit %d). Ran on %s (%s); Spark steps via ssh %s; PINS sha256 %s" % (verdict, worst, HERE, host_name(), SPARK, PINS_SHA[:16]))
     return worst
 
 
@@ -1327,7 +1327,7 @@ def main(argv):
             rc, out, err, ms, _ = remote("pins", b"", cacheable=False)
             print("# --- Spark (%s) ---" % SPARK)
             sys.stdout.write(out.decode())
-            print("# lifter on this Mac: %s" % (lifter_status() or "gen/lift.c and gen/lift.py match PINS"))
+            print("# lifter on this machine (%s): %s" % (HERE, lifter_status() or "gen/lift.c and gen/lift.py match PINS"))
             return rc
         if op == "convert" and len(rest) == 3:
             return cmd_convert(rest[0], rest[1], rest[2], as_json)

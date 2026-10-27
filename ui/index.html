@@ -67,7 +67,7 @@ ul.tight { margin:4px 0; padding-left:18px; }
 
 <section class="card">
   <div class="bar">
-    <select id="file" title="source file"></select>
+    <select id="file" title="source file" autocomplete="off"></select>
     <span class="mut small">lang</span>
     <select id="lang"><option value="c">C</option><option value="py">Python</option><option value="om">.om</option></select>
     <span class="mut small">|</span>
@@ -198,6 +198,7 @@ async function loadInfo() {
 }
 
 async function loadFile(path) {
+  $("file").value = path;
   const j = await api("/api/file?path=" + encodeURIComponent(path));
   if (j.error) return;
   $("orig").value = j.src; $("lang").value = j.lang;
