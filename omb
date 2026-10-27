@@ -1140,7 +1140,7 @@ def verify(paths, quick, as_json):
         else:
             print("converted on SPARK via ssh %s: %s" % (SPARK, ", ".join("%s %s" % (k, "%.0fms" % v["ms"] if v["ms"] else "cached")
                                                                      for k, v in steps)))
-            print("run on %s: every form below (clang, python3, jsc)" % HERE)
+            print("run on %s: every form below (clang, python3, jsc); ms = wall time of one process running all vectors of the unit, process start included" % HERE)
         domain = load_domain(path)
         vectors = {f.name: gen_vectors(f, n, "omb-1", domain.get(f.name)) for f in P["fns"] if f.scalar}
         runs = run_forms(P, vectors)
