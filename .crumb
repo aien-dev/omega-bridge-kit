@@ -1,0 +1,16 @@
+{
+  "extensions": {
+    "parent": "aien-dev/omega-bridge@358c505105793f202ad2b0c32a8623b606e029cd",
+    "parent_note": "Parent is recorded under extensions because the crumb schema has additionalProperties:false at top level."
+  },
+  "invariants": [
+    "Every compiler step runs on the Spark from sources pinned by sha256 in PINS; a mismatch stops the kit.",
+    "omb, ui/ and remote/ are host infrastructure (CLI, UI, harness), never converters.",
+    "NOT_RUN and REFUSED are never counted as PASS; verify fails if the negative control is not caught.",
+    "The UI binds 127.0.0.1 only and loads nothing from outside the kit."
+  ],
+  "layer": "tooling",
+  "name": "omega-bridge-kit",
+  "purpose": "Mac-side kit that shows the Omega bridge converting C/Python to .om and back to C, Python, native AArch64 and WebAssembly, runs every form on the same seeded inputs and compares them, with a CLI (omb) and a local UI.",
+  "schema_version": "1.0.0"
+}

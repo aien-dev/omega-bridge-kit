@@ -1,0 +1,1356 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+"""omb: command line for omega-bridge-kit.
+
+Host infrastructure only (CLI, test harness, UI glue). omb never converts anything itself:
+.om -> C/Python/native/wasm runs the pinned Omega tools on the Spark over ssh, C/Python -> .om runs
+the lifter (Omega source src/lift.om, shipped as its toc output gen/lift.c and gen/lift.py) on this Mac.
+
+  omb setup                         install/verify the pinned tools on the Spark (ssh)
+  omb pins                          print local PINS and what the Spark has installed
+  omb convert FROM TO FILE          FROM c|py|om, TO om|c|py|native|wasm; result on stdout
+  omb run FILE [--fn NAME] ARGS...  run every form of one function on ARGS, compare
+  omb roundtrip FILE                bridge(lift(bridge X)) == bridge X, for C and Python
+  omb verify [--quick] [FILE...]    full matrix over picks/ and samples/ plus a negative control
+
+Global options: --json (JSONL records on stdout), --fresh (ignore the conversion cache).
+Environment: OMB_SPARK (ssh host, default spark), OMB_WORK (scratch, default .omb/ in the kit).
+Exit: 0 PASS, 1 mismatch or unexpected refusal, 2 something NOT_RUN, 3 negative control not
+caught, 64 usage, 65 setup/pin problem.
+"""
+import base64
+import hashlib
+import json
+import os
+import random
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+KIT = os.path.dirname(os.path.realpath(__file__))
+WORK = os.environ.get("OMB_WORK") or os.path.join(KIT, ".omb")
+SPARK = os.environ.get("OMB_SPARK", "spark")
+REMOTE_KIT = ".local/share/omega-bridge-kit/kit"
+JSC = "/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc"
+FORMS = ["ORIGINAL", "OM>C", "OM>PY", "NATIVE", "WASM", "RT-C", "RT-PY"]
+HERE = "MAC" if sys.platform == "darwin" else "HOST-" + os.uname().sysname.upper()   # where omb itself runs
+FORM_WHERE = {f: HERE for f in FORMS}
+TYPES = {"bool": (1, False), "uchar": (8, False), "ushort": (16, False), "uint": (32, False),
+         "ulong": (64, False), "byte": (8, True), "short": (16, True), "int": (32, True), "long": (64, True)}
+CTYPE = {"bool": "uint8_t", "uchar": "uint8_t", "ushort": "uint16_t", "uint": "uint32_t", "ulong": "uint64_t",
+         "byte": "int8_t", "short": "int16_t", "int": "int32_t", "long": "int64_t"}
+M64 = (1 << 64) - 1
+TRAPS = {1: "overflow", 2: "divide by zero", 3: "bounds", 4: "loop bound", 5: "conversion", 6: "resource",
+         7: "shift", 8: "invalid argument", 9: "reentry"}
+
+
+class OmbError(Exception):
+    def __init__(self, msg, code=65):
+        super().__init__(msg)
+        self.code = code
+
+
+# ---------------------------------------------------------------- logging
+EVENTS = []          # every command run, MAC or SPARK; the UI shows these verbatim
+QUIET = False
+
+
+def log_event(where, cmd, rc, ms, note=""):
+    ev = {"where": where, "cmd": cmd, "rc": rc, "ms": round(ms, 1), "note": note, "t": time.time()}
+    EVENTS.append(ev)
+    if not QUIET:
+        sys.stderr.write("[%s] $ %s  (rc=%s, %.0f ms%s)\n" % (where, cmd, rc, ms, ", " + note if note else ""))
+    return ev
+
+
+def sh_join(cmd):
+    return " ".join(shlex.quote(c) for c in cmd)
+
+
+class mac_lock:
+    """On macOS, serialize timing runs with every other lane using the Mac:
+    the same lock file `/usr/bin/lockf -k ~/omega-work/.mac.lock` takes (flock semantics).
+    Skipped when an outer lockf already holds it (OMB_MAC_LOCK_HELD=1) or off macOS."""
+    def __enter__(self):
+        self.fh = None
+        if sys.platform != "darwin" or os.environ.get("OMB_MAC_LOCK_HELD") == "1":
+            return self
+        import fcntl
+        d = os.path.expanduser("~/omega-work")
+        os.makedirs(d, exist_ok=True)
+        self.fh = open(os.path.join(d, ".mac.lock"), "a")
+        t = time.time()
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        log_event(HERE, "flock ~/omega-work/.mac.lock  # same lock as /usr/bin/lockf -k", 0, (time.time() - t) * 1000, "waited for lock")
+        return self
+
+    def __exit__(self, *a):
+        if self.fh:
+            self.fh.close()
+
+
+def run_local(cmd, data=b"", timeout=600, show=None, cwd=None):
+    t = time.time()
+    try:
+        p = subprocess.run(cmd, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, cwd=cwd)
+        rc, out, err = p.returncode, p.stdout, p.stderr
+    except FileNotFoundError as e:
+        rc, out, err = 127, b"", str(e).encode()
+    except subprocess.TimeoutExpired:
+        rc, out, err = 124, b"", b"timeout"
+    ms = (time.time() - t) * 1000
+    log_event(HERE, show or sh_join(cmd), rc, ms)
+    return rc, out, err, ms
+
+
+# ---------------------------------------------------------------- pins
+def read_pins(path=None):
+    path = path or os.path.join(KIT, "PINS")
+    raw = open(path, "rb").read()
+    pins = {}
+    for line in raw.decode().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            pins[k] = v
+    return pins, hashlib.sha256(raw).hexdigest()
+
+
+PINS, PINS_SHA = read_pins()
+
+
+def sha256_file(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+
+
+# ---------------------------------------------------------------- Spark over ssh
+FRESH = False
+
+
+def remote(op, data, cacheable=True):
+    """Run one omb-remote.sh op on the Spark. Returns (rc, out, err, ms, cached)."""
+    cmd = ["ssh", "-o", "BatchMode=yes", SPARK, "sh", REMOTE_KIT + "/remote/omb-remote.sh", op, PINS_SHA]
+    key = hashlib.sha256(op.encode() + b"\0" + PINS_SHA.encode() + b"\0" + data).hexdigest()
+    cdir = os.path.join(WORK, "cache", key[:2])
+    cfile = os.path.join(cdir, key + ".json")
+    if cacheable and not FRESH and os.path.exists(cfile):
+        c = json.load(open(cfile))
+        log_event("SPARK via ssh", sh_join(cmd) + " < input", c["rc"], 0,
+                  "cached: same input+PINS converted over ssh earlier (%.0f ms then); --fresh reruns" % c["ms"])
+        return c["rc"], base64.b64decode(c["out"]), base64.b64decode(c["err"]), 0.0, True
+    t = time.time()
+    p = subprocess.run(cmd, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    ms = (time.time() - t) * 1000
+    log_event("SPARK via ssh", sh_join(cmd) + " < input", p.returncode, ms)
+    if p.returncode == 255:
+        raise OmbError("ssh to %s failed: %s" % (SPARK, p.stderr.decode(errors="replace").strip()))
+    if p.returncode in (65, 66):
+        raise OmbError(p.stderr.decode(errors="replace").strip() + " (run: ./omb setup)")
+    if cacheable and p.returncode in (0,) + tuple(range(1, 64)) + (110,):
+        os.makedirs(cdir, exist_ok=True)
+        json.dump({"rc": p.returncode, "ms": ms, "out": base64.b64encode(p.stdout).decode(),
+                   "err": base64.b64encode(p.stderr).decode()}, open(cfile, "w"))
+    return p.returncode, p.stdout, p.stderr, ms, False
+
+
+def setup():
+    cmd = "tar -cf - PINS remote | ssh -o BatchMode=yes %s 'D=$HOME/%s; mkdir -p \"$D\" && tar -xf - -C \"$D\" && sh \"$D/remote/setup.sh\"'" % (
+        shlex.quote(SPARK), REMOTE_KIT)
+    t = time.time()
+    p = subprocess.run(["sh", "-c", cmd], cwd=KIT)
+    log_event("SPARK via ssh", cmd, p.returncode, (time.time() - t) * 1000)
+    return p.returncode
+
+
+# ---------------------------------------------------------------- lifter (on this Mac)
+def lifter_status():
+    for k in ("LIFT_SHA", "LIFT_C_SHA256", "LIFT_PY_SHA256"):
+        if PINS.get(k, "PENDING") == "PENDING":
+            return "lifter not pinned yet (%s=PENDING in PINS)" % k
+    for f, k in (("gen/lift.c", "LIFT_C_SHA256"), ("gen/lift.py", "LIFT_PY_SHA256")):
+        p = os.path.join(KIT, f)
+        if not os.path.exists(p):
+            return "%s missing" % f
+        if sha256_file(p) != PINS[k]:
+            return "%s sha256 %s differs from PINS %s" % (f, sha256_file(p), PINS[k])
+    return None
+
+
+def cc():
+    return shutil.which("clang") or shutil.which("cc") or "cc"
+
+
+def lift_binary():
+    why = lifter_status()
+    if why:
+        raise OmbError(why, 2)
+    out = os.path.join(WORK, "bin", "lift-" + PINS["LIFT_C_SHA256"][:16])
+    if not os.path.exists(out):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        rc, _, err, _ = run_local([cc(), "-std=gnu11", "-O2", "-w", "-o", out + ".tmp", os.path.join(KIT, "gen/lift.c")])
+        if rc:
+            raise OmbError("clang could not build gen/lift.c: " + err.decode(errors="replace")[:400], 2)
+        os.replace(out + ".tmp", out)
+    return out
+
+
+def lift(lang, src, impl="c"):
+    """lang 'c'|'py'. impl 'c' = clang-built gen/lift.c, 'py' = python3 gen/lift.py, 'spark' = remote."""
+    data = (b"c" if lang == "c" else b"p") + src
+    if impl == "spark":
+        rc, out, err, ms, _ = remote("lift-c" if lang == "c" else "lift-py", src)
+        return rc, out, err, ms, "SPARK"
+    if impl == "c":
+        cmd = [lift_binary()]
+        show = "%s < input  # lift.c built by clang from gen/lift.c, selector '%s'" % (os.path.relpath(cmd[0], KIT), data[:1].decode())
+    else:
+        why = lifter_status()
+        if why:
+            raise OmbError(why, 2)
+        cmd = [sys.executable, os.path.join(KIT, "gen/lift.py")]
+        show = "python3 gen/lift.py < input  # selector '%s'" % data[:1].decode()
+    rc, out, err, ms = run_local(cmd, data, show=show)
+    return rc, out, err, ms, HERE
+
+
+SKIP_RE = re.compile(r"^lift: skip (\S+) line (\d+): (.*)$")
+FATAL_RE = re.compile(r"^lift: line (\d+): (.*)$")
+
+
+def parse_lift_err(err):
+    skips, fatal, other = [], [], []
+    for line in err.decode(errors="replace").splitlines():
+        m = SKIP_RE.match(line)
+        if m:
+            skips.append({"name": m.group(1), "line": int(m.group(2)), "reason": m.group(3)})
+            continue
+        m = FATAL_RE.match(line)
+        if m:
+            fatal.append({"line": int(m.group(1)), "reason": m.group(2)})
+        elif line.strip():
+            other.append(line)
+    return skips, fatal, other
+
+
+# ---------------------------------------------------------------- .om units
+class Fn:
+    def __init__(self, name, params, ret, start, end, lines):
+        self.name, self.params, self.ret = name, params, ret
+        self.start, self.end, self.lines = start, end, lines     # 1-based inclusive line numbers
+        self.calls = set()
+        self.scalar = all(t in TYPES for _, t in params) and (ret in TYPES or ret == "void")
+
+    def sig(self):
+        return "%s(%s) -> %s" % (self.name, ", ".join("%s %s" % p for p in self.params), self.ret)
+
+
+def parse_unit(text):
+    """Split an .om function unit into functions. Returns (header_lines, [Fn], orig_names)."""
+    lines = text.split("\n")
+    fns, header, orig = [], [], {}
+    cur = None
+    for i, line in enumerate(lines, 1):
+        s = line.strip()
+        m = re.match(r"note orig (\S+) -> (\S+)", s)
+        if m:
+            orig[m.group(2)] = m.group(1)
+        if line.startswith("fn "):
+            toks = line.split()
+            name = toks[1]
+            if "to" in toks:
+                ti = toks.index("to")
+                ret = " ".join(toks[ti + 1:])
+                ptoks = toks[2:ti]
+            else:
+                ret, ptoks = "void", toks[2:]
+            params, j = [], 0
+            while j < len(ptoks):
+                pname = ptoks[j]
+                if j + 1 < len(ptoks) and ptoks[j + 1] in ("edit", "view"):
+                    params.append((pname, " ".join(ptoks[j + 1:j + 4])))
+                    j += 4
+                else:
+                    params.append((pname, ptoks[j + 1] if j + 1 < len(ptoks) else "?"))
+                    j += 2
+            cur = Fn(name, params, ret, i, i, [line])
+            fns.append(cur)
+        elif cur is not None and not line.startswith(("global ", "note ")):
+            cur.lines.append(line)
+            if s:
+                cur.end = i
+        elif cur is None:
+            header.append(line)
+    names = {f.name for f in fns}
+    for f in fns:
+        for line in f.lines[1:]:
+            for tok in line.split():
+                if tok in names:
+                    f.calls.add(tok)
+        while f.lines and not f.lines[-1].strip():
+            f.lines.pop()
+    return header, fns, orig
+
+
+def closure(fn, byname):
+    seen, stack = [], [fn.name]
+    while stack:
+        n = stack.pop()
+        if n in seen:
+            continue
+        seen.append(n)
+        stack.extend(sorted(byname[n].calls))
+    return seen
+
+
+def recursive(fn, byname):
+    """True if fn's closure contains a call cycle (omc function mode error 9, IR mode error 3)."""
+    for n in closure(fn, byname):
+        for c in byname[n].calls:
+            if n in closure(byname[c], byname):
+                return True
+    return False
+
+
+def topo(names, byname):
+    out, state = [], {}
+
+    def visit(n):
+        if state.get(n) == 2:
+            return
+        if state.get(n) == 1:
+            return       # cycle: order is arbitrary, the compiler will refuse it
+        state[n] = 1
+        for c in sorted(byname[n].calls):
+            if c in names:
+                visit(c)
+        state[n] = 2
+        out.append(n)
+    for n in names:
+        visit(n)
+    return out
+
+
+def unit_text(names, byname):
+    return "\n".join("\n".join(byname[n].lines) for n in names) + "\n"
+
+
+def owner_at(text, line):
+    """The function whose body contains 1-based `line` of `text` (last `fn ` header at or above it)."""
+    name = None
+    for i, l in enumerate(text.split("\n"), 1):
+        if i > line:
+            break
+        if l.startswith("fn "):
+            name = l.split()[1]
+    return name
+
+
+OMC_ERR = re.compile(r"(\w+): line (\d+): error (\d+)")
+
+
+# ---------------------------------------------------------------- conversions (Spark)
+def expected_refusal(kind, fn, byname):
+    """Why a refusal of fn by this compiler is the documented one (None = unexpected)."""
+    if recursive(fn, byname):
+        return {"toc": "call cycle: toc library mode refuses recursion (omc error 9)",
+                "native": "call cycle: omc function mode refuses recursion (error 9)",
+                "wasm": "call cycle: IR mode calls only earlier functions (error 3)"}[kind]
+    if kind == "native":
+        if len(fn.params) > 6:
+            return "more than 6 parameters (native ABI v1)"
+        for _, t in fn.params:
+            if t not in ("ulong", "long"):
+                return "parameter type %s outside native ABI v1 (ulong, long, ulong/uchar arrays)" % t
+        if fn.ret not in ("ulong", "long", "void"):
+            return "result type %s outside native ABI v1 (ulong, long, void)" % fn.ret
+    if kind == "wasm" and not fn.scalar:
+        return "IR mode is scalar only"
+    return None
+
+
+TOOL = {"toc": "omega-bridge toc (bootstrap omc %s)", "native": "omc 734f0a39 function mode + native.om",
+        "wasm": "omega-mv omc ir + irwasm"}
+
+
+def converge(kind, op, om_text, line_offset=0):
+    """Send the unit; when the compiler refuses, attribute the refusal to the function at the
+    reported line, drop it and every function that calls it, and resend the rest.
+    Returns {"rc", "out", "exported", "refused": {name: {msg, rc, tool, expected}}, "ms", "err"}."""
+    header, fns, _ = parse_unit(om_text.decode())
+    byname = {f.name: f for f in fns}
+    todo = [f.name for f in fns]
+    if kind == "wasm":
+        todo = topo(todo, byname)
+        data = unit_text(todo, byname).encode()
+    else:
+        data = om_text
+    refused, ms_total = {}, 0.0
+    tool = TOOL[kind] % PINS.get("BOOT_OMC_SHA256", "")[:8] if kind == "toc" else TOOL[kind]
+    while todo:
+        if kind == "native":
+            units = []
+            for n in todo:
+                units.append(topo([c for c in closure(byname[n], byname) if c != n], byname) + [n])
+            texts = [unit_text(u, byname) for u in units]
+            data = "#omb-unit\n".join(texts).encode()
+        rc, out, err, ms, _ = remote(op, data)
+        ms_total += ms
+        errs = err.decode(errors="replace")
+        if rc == 0:
+            return {"rc": 0, "out": out, "exported": todo, "refused": refused, "ms": ms_total, "err": errs, "sent": data}
+        newly = {}
+        for line in errs.splitlines():
+            text, msg, unit_fn = data.decode(), line, None
+            mu = re.match(r"omb-remote: unit (\d+): (.*)", line)
+            if kind == "native":
+                if not mu or int(mu.group(1)) > len(todo):
+                    continue
+                k = int(mu.group(1)) - 1
+                text, msg, unit_fn = texts[k], mu.group(2), todo[k]
+            m = OMC_ERR.search(msg)
+            owner = owner_at(text, int(m.group(2)) - line_offset) if m else None
+            if unit_fn:
+                where = " (in helper %s)" % owner if owner and owner != unit_fn else ""
+                newly[unit_fn] = msg + where
+            elif owner in todo:
+                newly[owner] = msg + " (line %d of the unit sent = fn %s)" % (int(m.group(2)) - line_offset, owner)
+        if not newly:
+            for n in todo:
+                refused[n] = {"msg": errs.strip() or "exit %d" % rc, "rc": rc, "tool": tool, "expected": None}
+            break
+        for n, msg in newly.items():
+            refused[n] = {"msg": msg, "rc": rc, "tool": tool, "expected": expected_refusal(kind, byname[n], byname)}
+        for n in todo:
+            if n in refused:
+                continue
+            bad = [x for x in newly if x in closure(byname[n], byname)]
+            if bad:
+                refused[n] = {"msg": "calls refused function %s" % bad[0], "rc": rc, "tool": tool,
+                              "expected": refused[bad[0]]["expected"] and "depends on " + bad[0]}
+        todo = [n for n in todo if n not in refused]
+        if kind == "toc":
+            data = ("\n".join(h for h in header if h.strip()) + "\n" if any(h.strip() for h in header) else "").encode() \
+                + unit_text(todo, byname).encode()
+        elif kind == "wasm":
+            data = unit_text(todo, byname).encode()
+    return {"rc": 1, "out": b"", "exported": [], "refused": refused, "ms": ms_total, "err": "", "sent": b""}
+
+
+def toc(om, lang):
+    return converge("toc", "toc-c" if lang == "c" else "toc-py", om)
+
+
+def native(om_text):
+    """.om unit -> one C binding. Each function F is one unit: its callees (topological), then F
+    last, which native.om exports as omega_F."""
+    r = converge("native", "native-c", om_text)
+    r["hex"] = {}
+    for m in re.finditer(r"ombr_code_(\w+):\\n\.byte ([0-9a-fx,]+)", r["out"].decode(errors="replace")):
+        r["hex"][m.group(1)] = "".join("%02x" % int(b, 16) for b in m.group(2).split(","))
+    return r
+
+
+def wasm(om_text):
+    """.om unit -> one wasm module (topological order; IR mode reads an extra 'ir' line first)."""
+    return converge("wasm", "wasm", om_text, line_offset=1)
+
+# ---------------------------------------------------------------- values
+def typed_range(t):
+    w, s = TYPES[t]
+    return (-(1 << (w - 1)), (1 << (w - 1)) - 1) if s else (0, (1 << w) - 1)
+
+
+def to_bits(v):
+    return v & M64
+
+
+def from_bits(b, t):
+    if t == "void":
+        return 0
+    w, s = TYPES[t]
+    b &= M64
+    if s:
+        return b - (1 << 64) if b >> 63 else b
+    return b
+
+
+def edge_values(t, lo, hi):
+    vals = {lo, hi, 0, 1, 2, -1, -2, lo + 1, hi - 1, 3, 7, 10, 100}
+    w = TYPES[t][0]
+    for k in range(1, w + 1):
+        for d in (-1, 0, 1):
+            vals.add((1 << k) + d)
+            vals.add(-(1 << k) + d)
+    return sorted(v for v in vals if lo <= v <= hi)
+
+
+def gen_vectors(fn, n, seed, domain=None):
+    """Seeded vectors in each parameter's valid domain (type range, narrowed by DOMAIN.json),
+    edge values first, then small, medium and full-range random values."""
+    rng = random.Random("%s:%s" % (seed, fn.name))
+    ranges = []
+    for i, (_, t) in enumerate(fn.params):
+        lo, hi = typed_range(t)
+        if domain and i < len(domain) and domain[i]:
+            lo, hi = max(lo, domain[i][0]), min(hi, domain[i][1])
+        ranges.append((t, lo, hi))
+    if not ranges:
+        return [()]
+    out, seen = [], set()
+
+    def add(v):
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    edges = [edge_values(t, lo, hi) for t, lo, hi in ranges]
+    for _ in range(n * 4):
+        if len(out) >= n // 3:
+            break
+        add(tuple(rng.choice(e) for e in edges))
+    tries = 0
+    while len(out) < n and tries < n * 50:
+        tries += 1
+        v = []
+        for t, lo, hi in ranges:
+            r = rng.random()
+            if r < 0.45:
+                a, b = max(lo, -100), min(hi, 100)
+            elif r < 0.75:
+                a, b = max(lo, -(1 << 20)), min(hi, 1 << 20)
+            else:
+                a, b = lo, hi
+            if a > b:
+                a, b = lo, hi
+            v.append(rng.randint(a, b))
+        add(tuple(v))
+    return out
+
+
+# ---------------------------------------------------------------- form runners (on this Mac)
+def build_dir(*parts):
+    h = hashlib.sha256(b"\0".join(p if isinstance(p, bytes) else p.encode() for p in parts)).hexdigest()[:20]
+    d = os.path.join(WORK, "build", h)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def vec_lines(fns, vectors):
+    """vectors: list of (fn_index, values). Line: index then canonical 64-bit bits."""
+    return "".join("%d %s\n" % (k, " ".join(str(to_bits(x)) for x in v)) for k, v in vectors).encode()
+
+
+def c_driver(fns, header):
+    cases = []
+    for k, f in enumerate(fns):
+        args = ", ".join("a[%d]" % i for i in range(len(f.params)))
+        cases.append("case %d: s=omega_%s(&r%s%s); break;" % (k, f.name, ", " if args else "", args))
+    return ("#include <stdio.h>\n#include <stdint.h>\n#include <inttypes.h>\n%s\n"
+            "int main(void){int k;uint64_t a[8]={0},r;uint32_t s;\n"
+            "while(scanf(\"%%d\",&k)==1){int n=0;switch(k){%s default:return 70;}\n"
+            "for(int i=0;i<n;i++)if(scanf(\"%%\" SCNu64,&a[i])!=1)return 71;\n"
+            "r=0;switch(k){%s default:return 70;}\n"
+            "if(s)printf(\"T %%u\\n\",s);else printf(\"0 %%\" PRIu64 \"\\n\",r);}\n"
+            "return 0;}\n") % (header, " ".join("case %d: n=%d; break;" % (k, len(f.params)) for k, f in enumerate(fns)),
+                               " ".join(cases))
+
+
+def parse_results(out, fns, vectors, form):
+    res = []
+    lines = out.decode(errors="replace").splitlines()
+    for i, (k, v) in enumerate(vectors):
+        if i >= len(lines):
+            res.append(("err", "no output (process ended early)"))
+            continue
+        line = lines[i]
+        if line.startswith("0 "):
+            res.append(("ok", from_bits(int(line[2:]), fns[k].ret)))
+        elif line.startswith("T "):
+            c = line[2:].strip()
+            res.append(("trap", int(c) if c.isdigit() else None))
+        elif line.startswith("V "):
+            res.append(("ok", int(line[2:])))
+        else:
+            res.append(("err", line[2:] if len(line) > 2 else line))
+    return res
+
+
+def compile_c(sources, out, extra=()):
+    cmd = [cc(), "-std=gnu11", "-O2", "-w"] + list(extra) + ["-o", out] + sources
+    rc, _, err, ms = run_local(cmd, show=sh_join([os.path.relpath(c, KIT) if c.startswith(KIT) else c for c in cmd]))
+    return rc, err.decode(errors="replace")
+
+
+def run_omega_c(c_src, fns, vectors, kind):
+    """Generated C (toc) or native binding C, called through omega_<name>."""
+    d = build_dir(kind, c_src, ",".join(f.sig() for f in fns))
+    exe = os.path.join(d, "run")
+    if not os.path.exists(exe):
+        lib = os.path.join(d, "unit.c")
+        open(lib, "wb").write(c_src)
+        drv = os.path.join(d, "driver.c")
+        if kind == "toc":
+            open(drv, "w").write(c_driver(fns, '#include "unit.c"'))
+            rc, err = compile_c([drv], exe + ".tmp")
+        else:
+            protos = "\n".join("uint32_t omega_%s(uint64_t *r%s);" % (f.name, "".join(", uint64_t" for _ in f.params)) for f in fns)
+            open(drv, "w").write(c_driver(fns, protos))
+            rc, err = compile_c([drv, lib], exe + ".tmp")
+        if rc:
+            return None, "clang build failed on %s: %s" % (host_name(), first_error(err)), 0
+        os.replace(exe + ".tmp", exe)
+    rc, out, err, ms = run_local([exe], vec_lines(fns, vectors), show="%s < vectors" % os.path.relpath(exe, KIT))
+    if rc:
+        return None, "runner exit %d: %s" % (rc, err.decode(errors="replace")[:300]), ms
+    return parse_results(out, fns, vectors, kind), None, ms
+
+
+def first_error(err):
+    for line in err.splitlines():
+        if "error" in line:
+            return line.strip()[:300]
+    return err.strip()[:300]
+
+
+PY_TOC_DRIVER = r'''
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("omb_unit", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+names = sys.argv[2].split(",")
+out = []
+for line in sys.stdin:
+    p = line.split()
+    s, v = getattr(m, "omega_" + names[int(p[0])])(*[int(x) for x in p[1:]])
+    out.append("T %d" % s if s else "0 %d" % (v or 0))
+sys.stdout.write("\n".join(out) + "\n")
+'''
+
+
+def run_omega_py(py_src, fns, vectors):
+    d = build_dir("py", py_src)
+    mod = os.path.join(d, "unit.py")
+    open(mod, "wb").write(py_src)
+    drv = os.path.join(d, "driver.py")
+    open(drv, "w").write(PY_TOC_DRIVER)
+    cmd = [sys.executable, drv, mod, ",".join(f.name for f in fns)]
+    rc, out, err, ms = run_local(cmd, vec_lines(fns, vectors), show="python3 %s %s < vectors" % (os.path.relpath(drv, KIT), os.path.relpath(mod, KIT)))
+    if rc:
+        return None, "python3 exit %d: %s" % (rc, err.decode(errors="replace")[-300:]), ms
+    return parse_results(out, fns, vectors, "py"), None, ms
+
+
+JSC_DRIVER = r'''
+const bytes = readFile(arguments[0], "binary");
+if (!WebAssembly.validate(bytes)) { print("E invalid wasm"); throw 0; }
+const mod = new WebAssembly.Module(bytes);
+if (WebAssembly.Module.imports(mod).length) { print("E unexpected import"); throw 0; }
+const ex = new WebAssembly.Instance(mod, {}).exports;
+const W = {bool:1,uchar:8,ushort:16,uint:32,ulong:64,byte:8,short:16,int:32,long:64};
+const S = {byte:1,short:1,int:1,long:1};
+const out = [];
+for (const line of readFile(arguments[1]).split("\n")) {
+  if (!line) continue;
+  const p = line.split(" "), name = p[0], ret = p[1];
+  const args = p.slice(2).map(a => { const [t, v] = a.split(":"); return W[t] === 64 ? BigInt(v) : Number(v); });
+  try {
+    let r = ex[name](...args);
+    if (ret === "void") r = 0n;
+    else if (W[ret] === 64) r = BigInt(r);
+    else r = S[ret] ? BigInt.asIntN(W[ret], BigInt(r)) : BigInt.asUintN(W[ret], BigInt(r));
+    out.push("V " + r.toString());
+  } catch (e) {
+    out.push(e instanceof WebAssembly.RuntimeError ? "T " + e.message : "E " + e);
+  }
+}
+print(out.join("\n"));
+'''
+
+
+def run_wasm_jsc(wasm_bytes, fns, vectors):
+    if not os.path.exists(JSC):
+        return None, "jsc not found at %s (macOS JavaScriptCore)" % JSC, 0
+    d = build_dir("wasm", wasm_bytes)
+    wf = os.path.join(d, "unit.wasm")
+    open(wf, "wb").write(wasm_bytes)
+    js = os.path.join(d, "driver.js")
+    open(js, "w").write(JSC_DRIVER)
+    vf = os.path.join(d, "vectors-%d.txt" % os.getpid())
+    with open(vf, "w") as fh:
+        for k, v in vectors:
+            f = fns[k]
+            fh.write("%s %s %s\n" % (f.name, f.ret, " ".join("%s:%d" % (t, x) for (_, t), x in zip(f.params, v))))
+    rc, out, err, ms = run_local([JSC, js, "--", wf, vf], show="jsc %s -- %s %s" % (os.path.relpath(js, KIT), os.path.relpath(wf, KIT), os.path.relpath(vf, KIT)))
+    os.unlink(vf)
+    if rc:
+        return None, "jsc exit %d: %s" % (rc, (out + err).decode(errors="replace")[-300:]), ms
+    res = []
+    for r in parse_results(out, fns, vectors, "wasm"):
+        if r[0] == "trap":
+            res.append(("trap", None))      # wasm traps carry no Omega trap code
+        else:
+            res.append(r)
+    return res, None, ms
+
+
+def orig_c_driver(path, fns, origname):
+    cases = []
+    for k, f in enumerate(fns):
+        args = ", ".join("(%s)(%s)a[%d]" % (CTYPE[t], "int64_t" if TYPES[t][1] else "uint64_t", i) for i, (_, t) in enumerate(f.params))
+        call = "%s(%s)" % (origname.get(f.name, f.name), args)
+        if f.ret == "void":
+            body = "%s; printf(\"V 0\\n\");" % call
+        elif TYPES[f.ret][1]:
+            body = "printf(\"V %%lld\\n\",(long long)(%s)%s);" % (CTYPE[f.ret], call)
+        else:
+            body = "printf(\"V %%llu\\n\",(unsigned long long)(%s)%s);" % (CTYPE[f.ret], call)
+        cases.append("case %d: %s break;" % (k, body))
+    nargs = " ".join("case %d: n=%d; break;" % (k, len(f.params)) for k, f in enumerate(fns))
+    return r'''#include "%s"
+#undef main
+#include <stdio.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+/* One fork per vector: a crash, undefined behaviour (UBSan) or a hang in the original cannot take
+   the harness down; it is reported as E for that vector only. */
+int main(void){int k;
+while(scanf("%%d",&k)==1){int n=0;int64_t a[8]={0};switch(k){%s default:return 70;}
+ for(int i=0;i<n;i++){char t[32];if(scanf("%%31s",t)!=1)return 71;a[i]=(int64_t)strtoull(t,0,10);}
+ fflush(stdout);pid_t p=fork();
+ if(p==0){alarm(2);switch(k){%s default:_exit(70);}fflush(stdout);_exit(0);}
+ int st=0;waitpid(p,&st,0);
+ if(WIFSIGNALED(st))printf("E signal %%d\n",WTERMSIG(st));
+ else if(WEXITSTATUS(st))printf("E exit %%d (UBSan or the original's own exit)\n",WEXITSTATUS(st));
+ fflush(stdout);}
+return 0;}
+''' % (path, nargs, " ".join(cases))
+
+
+def run_orig_c(path, fns, vectors, origname):
+    src = open(path, "rb").read()
+    d = build_dir("origc", src, ",".join(f.sig() for f in fns), json.dumps(origname, sort_keys=True))
+    exe = os.path.join(d, "run")
+    if not os.path.exists(exe):
+        drv = os.path.join(d, "driver.c")
+        open(drv, "w").write(orig_c_driver(os.path.abspath(path), fns, origname))
+        flags = ["-Dmain=omb_original_main", "-include", "stdlib.h", "-fsanitize=undefined", "-fno-sanitize-recover=undefined"]
+        rc, err = compile_c([drv], exe + ".tmp", flags)
+        if rc:
+            rc, err2 = compile_c([drv], exe + ".tmp", flags[:3])
+            if rc:
+                return None, "clang could not build the original with the driver: " + first_error(err2), 0
+        os.replace(exe + ".tmp", exe)
+    lines = "".join("%d %s\n" % (k, " ".join(str(x) for x in v)) for k, v in vectors).encode()
+    rc, out, err, ms = run_local([exe], lines, show="%s < vectors  # original C, -Dmain=omb_original_main, fork per vector" % os.path.relpath(exe, KIT))
+    if rc:
+        return None, "original C runner exit %d" % rc, ms
+    return parse_results(out, fns, vectors, "orig"), None, ms
+
+
+PY_ORIG_DRIVER = r'''
+import importlib.util, signal, sys
+sys.setrecursionlimit(10000)
+spec = importlib.util.spec_from_file_location("omb_original", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+names = sys.argv[2].split(",")
+def alarm(*_): raise TimeoutError("timeout 2 s")
+signal.signal(signal.SIGALRM, alarm)
+out = []
+for line in sys.stdin:
+    p = line.split()
+    try:
+        signal.alarm(2)
+        r = getattr(m, names[int(p[0])])(*[int(x) for x in p[1:]])
+        signal.alarm(0)
+        if r is None: r = 0
+        if isinstance(r, bool): r = int(r)
+        out.append("V %d" % r if isinstance(r, int) else "E returned %s" % type(r).__name__)
+    except BaseException as e:
+        signal.alarm(0)
+        out.append("E %s: %s" % (type(e).__name__, str(e)[:80].replace("\n", " ")))
+sys.stdout.write("\n".join(out) + "\n")
+'''
+
+
+def run_orig_py(path, fns, vectors, origname):
+    d = build_dir("origpy", PY_ORIG_DRIVER)
+    drv = os.path.join(d, "driver.py")
+    open(drv, "w").write(PY_ORIG_DRIVER)
+    names = ",".join(origname.get(f.name, f.name) for f in fns)
+    lines = "".join("%d %s\n" % (k, " ".join(str(x) for x in v)) for k, v in vectors).encode()
+    rc, out, err, ms = run_local([sys.executable, drv, os.path.abspath(path), names], lines,
+                                 show="python3 %s %s %s < vectors  # original Python, imported" % (os.path.relpath(drv, KIT), os.path.relpath(path, KIT), names))
+    if rc:
+        return None, "python3 exit %d: %s" % (rc, err.decode(errors="replace")[-300:]), ms
+    return parse_results(out, fns, vectors, "orig"), None, ms
+
+
+def host_name():
+    return "%s %s" % (os.uname().sysname, os.uname().machine)
+
+
+# ---------------------------------------------------------------- comparison
+def compare(form, ref, got, lang=None):
+    """Return (verdict, detail) for one vector. verdict: match | mismatch | excluded."""
+    if ref[0] == "trap":
+        if form == "ORIGINAL":
+            return "excluded", "Omega trapped (%s); outside the Omega function's defined domain" % TRAPS.get(ref[1], ref[1])
+        if got[0] == "trap" and (got[1] is None or got[1] == ref[1]):
+            return "match", ""
+        return "mismatch", "want trap %s, got %s" % (ref[1], got)
+    if ref[0] != "ok":
+        return "mismatch", "reference error %s" % (ref,)
+    if got[0] == "ok" and got[1] == ref[1]:
+        return "match", ""
+    if form == "ORIGINAL" and got[0] == "err" and lang == "c":
+        return "excluded", "original C: %s (no defined C result)" % got[1]
+    return "mismatch", "want %s, got %s" % (ref[1], got[1] if got[0] == "ok" else got)
+
+
+# ---------------------------------------------------------------- one source through every form
+def load_domain(path):
+    p = os.path.join(os.path.dirname(path), "DOMAIN.json")
+    if os.path.exists(p):
+        return json.load(open(p)).get(os.path.basename(path), {})
+    return {}
+
+
+def originals_in(src, lang):
+    text = src.decode(errors="replace")
+    if lang == "py":
+        return set(re.findall(r"^def\s+(\w+)\s*\(", text, re.M))
+    return set(re.findall(r"^[A-Za-z_][\w \t\*]*?\b(\w+)\s*\([^;{]*\)\s*\{", text, re.M))
+
+
+def prepare(path, need_rt=True):
+    """Lift (if needed) and convert one file into every form. Returns a dict describing it."""
+    ext = os.path.splitext(path)[1]
+    lang = {".c": "c", ".py": "py", ".om": "om"}.get(ext)
+    if not lang:
+        raise OmbError("%s: not .c, .py or .om" % path, 64)
+    src = open(path, "rb").read()
+    P = {"path": path, "lang": lang, "src": src, "notes": [], "lift": None}
+    if lang == "om":
+        om = src
+    else:
+        rc, om, err, ms, where = lift(lang, src, "c")
+        skips, fatal, other = parse_lift_err(err)
+        P["lift"] = {"rc": rc, "ms": ms, "skips": skips, "fatal": fatal, "other": other, "where": HERE + " (clang-built lift.c)"}
+        rc2, om2, err2, ms2, _ = lift(lang, src, "py")
+        P["lift"]["py_agrees"] = (rc2 == rc and om2 == om and err2 == err)
+        P["lift"]["py_ms"] = ms2
+        try:
+            rc3, om3, _, ms3, _ = lift(lang, src, "spark")
+            P["lift"]["spark_agrees"] = (rc3 == rc and om3 == om)
+        except OmbError as e:
+            P["lift"]["spark_agrees"] = None
+            P["lift"]["spark_note"] = str(e)
+        if rc or not om:
+            P["om"] = None
+            return P
+    P["om"] = om
+    header, fns, orig = parse_unit(om.decode())
+    P["fns"], P["origname"], P["byname"] = fns, orig, {f.name: f for f in fns}
+    if lang in ("c", "py"):
+        names = originals_in(src, lang)
+        P["has_original"] = {f.name: orig.get(f.name, f.name) in names for f in fns}
+    else:
+        P["has_original"] = {f.name: False for f in fns}
+    P["c"] = toc(om, "c")
+    P["py"] = toc(om, "py")
+    P["native"] = native(om)
+    P["wasm"] = wasm(om)
+    if need_rt and lifter_status() is None:
+        P["rt"] = {}
+        for lang2, gen in (("c", P["c"]), ("py", P["py"])):
+            if gen["rc"]:
+                continue
+            rc, om_rt, err, ms, _ = lift(lang2, gen["out"], "c")
+            entry = {"lift_rc": rc, "lift_err": err.decode(errors="replace"), "om": om_rt}
+            if rc == 0:
+                again = toc(om_rt, lang2)
+                entry["gen"] = again
+                entry["identical"] = again["rc"] == 0 and again["out"] == gen["out"]
+            else:
+                entry["identical"] = False
+            P["rt"][lang2] = entry
+    else:
+        P["rt"] = None
+    return P
+
+
+def run_forms(P, vectors_by_fn, forms=None):
+    """vectors_by_fn: {name: [values,...]}. Returns {form: {"results": {name: [...]}, "ms", "error"}}.
+    Each form runs only the functions its compiler exported."""
+    scalar = [f for f in P["fns"] if f.scalar]
+    out = {}
+    forms = forms or FORMS
+
+    def go(form, names, runner):
+        fs = [f for f in scalar if f.name in names]
+        if not fs:
+            return
+        vecs = [(k, v) for k, f in enumerate(fs) for v in vectors_by_fn.get(f.name, [])]
+        res, err, ms = runner(fs, vecs)
+        if res is None:
+            out[form] = {"results": None, "error": err, "ms": ms}
+            return
+        d = {f.name: [] for f in fs}
+        for (k, _), r in zip(vecs, res):
+            d[fs[k].name].append(r)
+        out[form] = {"results": d, "error": None, "ms": ms}
+
+    def gen_c(g, kind):
+        return lambda fs, vecs: run_omega_c(g["out"], fs, vecs, kind)
+
+    def gen_py(g):
+        return lambda fs, vecs: run_omega_py(g["out"], fs, vecs)
+
+    if "OM>C" in forms:
+        go("OM>C", P["c"]["exported"], gen_c(P["c"], "toc"))
+    if "OM>PY" in forms:
+        go("OM>PY", P["py"]["exported"], gen_py(P["py"]))
+    if "NATIVE" in forms:
+        go("NATIVE", P["native"]["exported"], gen_c(P["native"], "native"))
+    if "WASM" in forms:
+        go("WASM", P["wasm"]["exported"], lambda fs, vecs: run_wasm_jsc(P["wasm"]["out"], fs, vecs))
+    if "ORIGINAL" in forms and P["lang"] in ("c", "py"):
+        runner = run_orig_c if P["lang"] == "c" else run_orig_py
+        go("ORIGINAL", [n for n, h in P["has_original"].items() if h],
+           lambda fs, vecs: runner(P["path"], fs, vecs, P["origname"]))
+    for lang2, form in (("c", "RT-C"), ("py", "RT-PY")):
+        e = (P.get("rt") or {}).get(lang2)
+        if form in forms and e and e.get("gen"):
+            go(form, e["gen"]["exported"], gen_c(e["gen"], "toc") if lang2 == "c" else gen_py(e["gen"]))
+    return out
+
+
+def form_status(P, form, fname, runs, vectors):
+    """Cell for one function x form: dict(state=PASS|FAIL|REFUSED|UNEXPECTED_REFUSAL|NOT_RUN|N/A, ...)."""
+    f = P["byname"][fname]
+    if not f.scalar:
+        return {"state": "N/A", "why": "array signature: outside the kit's scalar matrix"}
+    if form == "ORIGINAL" and not P["has_original"].get(fname):
+        return {"state": "N/A", "why": "no original function of this name (lifter helper or .om input)"}
+    for form2, key in (("OM>C", "c"), ("OM>PY", "py"), ("NATIVE", "native"), ("WASM", "wasm")):
+        if form == form2 and fname in P[key]["refused"]:
+            r = P[key]["refused"][fname]
+            return {"state": "REFUSED" if r["expected"] else "UNEXPECTED_REFUSAL",
+                    "why": "REFUSED by %s: %s" % (r["tool"], r["msg"]) + ("  [expected: %s]" % r["expected"] if r["expected"] else ""),
+                    "expected": r["expected"]}
+    if form in ("RT-C", "RT-PY"):
+        if P.get("rt") is None:
+            return {"state": "NOT_RUN", "why": lifter_status() or "round trip not requested"}
+        e = P["rt"].get("c" if form == "RT-C" else "py")
+        if not e:
+            return {"state": "N/A", "why": "toc produced nothing to lift back"}
+        if e["lift_rc"]:
+            return {"state": "FAIL", "why": "lifter refused toc output: " + e["lift_err"].strip()[:200]}
+        if fname not in e["gen"]["exported"]:
+            if fname not in P["c"]["exported"]:
+                return {"state": "N/A", "why": "toc refused the function; nothing to round-trip"}
+            return {"state": "FAIL", "why": "function missing after the round trip"}
+    if fname not in P["c"]["exported"] and fname not in P["py"]["exported"]:
+        return {"state": "N/A", "why": "every toc form refused this function; no Omega reference to compare"}
+    run = runs.get(form)
+    if run is None:
+        return {"state": "NOT_RUN", "why": "form not produced"}
+    if run["results"] is None:
+        return {"state": "NOT_RUN", "why": run["error"]}
+    want = None
+    for rf in ("OM>C", "OM>PY"):
+        r = runs.get(rf)
+        if r and r["results"] and r["results"].get(fname) is not None:
+            want = r["results"][fname]
+            break
+    if want is None:
+        return {"state": "NOT_RUN", "why": "no Omega reference (OM>C or OM>PY) ran"}
+    got = run["results"].get(fname)
+    if got is None or want is None or len(got) != len(want):
+        return {"state": "NOT_RUN", "why": "results missing"}
+    n_match = n_excl = 0
+    bad = []
+    excl_why = {}
+    for i, (w, g) in enumerate(zip(want, got)):
+        v, why = compare(form, w, g, P["lang"])
+        if v == "match":
+            n_match += 1
+        elif v == "excluded":
+            n_excl += 1
+            excl_why[why.split(";")[0]] = excl_why.get(why.split(";")[0], 0) + 1
+        else:
+            bad.append({"args": list(vectors[fname][i]), "detail": why})
+    st = {"state": "PASS" if not bad and n_match else "FAIL", "match": n_match, "excluded": n_excl,
+          "total": len(want), "bad": bad[:5], "n_bad": len(bad), "excluded_why": excl_why, "ms": run["ms"]}
+    if not bad and not n_match:
+        st["why"] = "every vector excluded; nothing compared"
+    return st
+
+
+# ---------------------------------------------------------------- negative control
+MUTATIONS = [(r"\badd\b", "sub"), (r"\bsub\b", "add"), (r"\bmul\b", "add"), (r"\bdiv\b", "mul"), (r"\brem\b", "div")]
+
+
+def mutate(om_text, fn):
+    """Yield (mutated_text, description) for fn's body: first arithmetic op swap, else a constant +1,
+    else a comparison flip."""
+    lines = om_text.split("\n")
+    body = range(fn.start, fn.end)       # 0-based indices of body lines after the header line
+    for pat, rep in MUTATIONS:
+        for i in body:
+            if re.search(pat, lines[i]):
+                new = lines[:]
+                new[i] = re.sub(pat, rep, lines[i], count=1)
+                yield "\n".join(new), "line %d: %r -> %r" % (i + 1, lines[i].strip(), new[i].strip())
+    for i in body:
+        m = re.search(r"(?<![\w-])(\d+)\b", lines[i])
+        if m:
+            new = lines[:]
+            new[i] = lines[i][:m.start(1)] + str(int(m.group(1)) + 1) + lines[i][m.end(1):]
+            yield "\n".join(new), "line %d: %r -> %r (constant +1)" % (i + 1, lines[i].strip(), new[i].strip())
+    for a, b in (("ne", "eq"), ("eq", "ne"), ("lt", "ge"), ("gt", "le"), ("le", "gt"), ("ge", "lt")):
+        for i in body:
+            if re.search(r"\b%s\b" % a, lines[i]):
+                new = lines[:]
+                new[i] = re.sub(r"\b%s\b" % a, b, lines[i], count=1)
+                yield "\n".join(new), "line %d: %r -> %r" % (i + 1, lines[i].strip(), new[i].strip())
+
+
+def negative_control(P, vectors, runs):
+    """Mutate one function's .om, send it through the real path (Spark toc -> clang on the Mac),
+    and require the differential against the oracle (original if present, else unmutated OM>C) to FAIL."""
+    cand = [f for f in P["fns"] if f.scalar and vectors.get(f.name) and f.name in P["c"]["exported"]]
+    cand.sort(key=lambda f: not P["has_original"].get(f.name))
+    if not cand:
+        return {"state": "NOT_RUN", "why": "no scalar function to mutate"}
+    f = cand[0]
+    oracle = "ORIGINAL" if P["has_original"].get(f.name) and runs.get("ORIGINAL", {}).get("results") else "OM>C"
+    want = runs.get(oracle, {}).get("results", {}) or {}
+    want = want.get(f.name)
+    if want is None:
+        return {"state": "NOT_RUN", "why": "oracle %s did not run" % oracle}
+    tried = []
+    for text, desc in mutate(P["om"].decode(), f):
+        gen = toc(text.encode(), "c")
+        if f.name not in gen["exported"]:
+            tried.append(desc + " (toc refused the mutant)")
+            continue
+        fns = [g for g in P["fns"] if g.scalar and g.name in gen["exported"]]
+        vecs = [(fns.index(f), v) for v in vectors[f.name]]
+        res, err, ms = run_omega_c(gen["out"], fns, vecs, "toc")
+        if res is None:
+            tried.append(desc + " (" + err + ")")
+            continue
+        bad = 0
+        for i, (w, g) in enumerate(zip(want, res)):
+            if oracle == "ORIGINAL" and (w[0] != "ok" or runs["OM>C"]["results"][f.name][i][0] != "ok"):
+                continue     # same exclusions as the differential itself
+            if w != g:
+                bad += 1
+        return {"state": "CAUGHT" if bad else "MISSED", "fn": f.name, "mutation": desc, "oracle": oracle,
+                "mismatches": bad, "total": len(want), "tried": tried}
+    return {"state": "NOT_RUN", "why": "no mutation compiled", "tried": tried}
+
+
+# ---------------------------------------------------------------- reporting
+def mark(st):
+    s = st["state"]
+    if s == "PASS":
+        x = "✓ %d/%d" % (st["match"], st["total"] - st["excluded"])
+        if st["excluded"]:
+            x += " (+%d excl)" % st["excluded"]
+        return x + " %.0fms" % st["ms"]
+    if s == "FAIL":
+        return "✗ %d bad" % st.get("n_bad", 0) if "n_bad" in st else "✗ FAIL"
+    if s == "REFUSED":
+        return "REFUSED (expected)"
+    if s == "UNEXPECTED_REFUSAL":
+        return "✗ REFUSED"
+    return s
+
+
+def emit(rec):
+    sys.stdout.write(json.dumps(rec, default=lambda o: o.hex() if isinstance(o, bytes) else str(o)) + "\n")
+
+
+def table(rows, head):
+    w = [max(len(str(r[i])) for r in [head] + rows) for i in range(len(head))]
+    fmt = "  ".join("%%-%ds" % x for x in w)
+    print(fmt % tuple(head))
+    print("  ".join("-" * x for x in w))
+    for r in rows:
+        print(fmt % tuple(r))
+
+
+def discover(paths):
+    if paths:
+        return paths
+    out = []
+    for d in ("samples", "picks"):
+        p = os.path.join(KIT, d)
+        if os.path.isdir(p):
+            out += sorted(os.path.join(p, f) for f in os.listdir(p) if os.path.splitext(f)[1] in (".c", ".py", ".om"))
+    return out
+
+
+def verify(paths, quick, as_json):
+    n = 64 if quick else 500
+    worst = 0
+    summary = []
+    for path in discover(paths):
+        rel = os.path.relpath(path, KIT)
+        try:
+            P = prepare(path)
+        except OmbError as e:
+            if as_json:
+                emit({"file": rel, "state": "NOT_RUN", "why": str(e)})
+            else:
+                print("\n== %s\nNOT_RUN: %s" % (rel, e))
+            worst = max(worst, 2)
+            summary.append((rel, "NOT_RUN"))
+            continue
+        if not as_json:
+            print("\n== %s  (%s)" % (rel, {"c": "original C", "py": "original Python", "om": ".om unit"}[P["lang"]]))
+        if P["lift"]:
+            L = P["lift"]
+            if as_json:
+                emit({"file": rel, "lift": {k: v for k, v in L.items()}})
+            else:
+                print("lift [%s, clang-built lift.c] rc=%d %.0fms; python3 lift.py agrees: %s; Spark lifter agrees: %s" % (
+                    HERE, L["rc"], L["ms"], "✓" if L["py_agrees"] else "✗", {True: "✓", False: "✗", None: "NOT_RUN"}[L["spark_agrees"]]))
+                for s in L["skips"]:
+                    print("  skipped %s (line %d): %s" % (s["name"], s["line"], s["reason"]))
+                for s in L["fatal"]:
+                    print("  refused line %d: %s" % (s["line"], s["reason"]))
+            if not L["py_agrees"] or L["spark_agrees"] is False:
+                worst = 1
+            if P["om"] is None:
+                worst = max(worst, 1 if L["fatal"] else 2)
+                summary.append((rel, "LIFT REFUSED"))
+                continue
+        steps = [("toc C", P["c"]), ("toc Python", P["py"]), ("omc734+native.om", P["native"]), ("omc ir+irwasm", P["wasm"])]
+        if as_json:
+            emit({"file": rel, "converted_on": "SPARK via ssh " + SPARK,
+                  "steps": {k: {"ms": round(v["ms"], 1), "exported": v["exported"], "refused": sorted(v["refused"])} for k, v in steps}})
+        else:
+            print("converted on SPARK via ssh %s: %s" % (SPARK, ", ".join("%s %s" % (k, "%.0fms" % v["ms"] if v["ms"] else "cached")
+                                                                     for k, v in steps)))
+            print("run on %s: every form below (clang, python3, jsc)" % HERE)
+        domain = load_domain(path)
+        vectors = {f.name: gen_vectors(f, n, "omb-1", domain.get(f.name)) for f in P["fns"] if f.scalar}
+        runs = run_forms(P, vectors)
+        rows = []
+        for f in P["fns"]:
+            cells = {form: form_status(P, form, f.name, runs, vectors) for form in FORMS}
+            for form, st in cells.items():
+                if st["state"] in ("FAIL", "UNEXPECTED_REFUSAL"):
+                    worst = 1
+                elif st["state"] == "NOT_RUN" and worst != 1:
+                    worst = max(worst, 2)
+            if as_json:
+                emit({"file": rel, "fn": f.name, "sig": f.sig(), "vectors": len(vectors.get(f.name, [])), "forms": cells})
+            rows.append([f.name, len(vectors.get(f.name, []))] + [mark(cells[x]) for x in FORMS])
+            notes = [(x, c) for x, c in cells.items() if c["state"] not in ("PASS",) and c.get("why")]
+            f._notes = notes + [(x, c) for x, c in cells.items() if c.get("bad")]
+        if not as_json:
+            table(rows, ["function", "vectors"] + ["%s[%s]" % (x, FORM_WHERE[x]) for x in FORMS])
+            for f in P["fns"]:
+                for x, c in f._notes:
+                    if c.get("why"):
+                        print("  %s %s: %s" % (f.name, x, c["why"]))
+                    for b in c.get("bad", []):
+                        print("  %s %s ✗ args %s: %s" % (f.name, x, b["args"], b["detail"]))
+                for x in FORMS:
+                    c = form_status(P, x, f.name, runs, vectors)
+                    for why, k in c.get("excluded_why", {}).items():
+                        print("  %s %s: %d vectors excluded: %s" % (f.name, x, k, why))
+        if P.get("rt"):
+            for lang2 in ("c", "py"):
+                e = P["rt"].get(lang2)
+                if not e:
+                    continue
+                ok = e["identical"]
+                if not ok:
+                    worst = 1
+                if as_json:
+                    emit({"file": rel, "roundtrip": lang2, "identical": ok})
+                else:
+                    print("round trip %s: bridge %s (lift %s (bridge %s X)) == bridge %s X  byte-identical: %s" % (
+                        lang2, lang2, lang2, lang2, lang2, "✓" if ok else "✗"))
+        ctl = negative_control(P, vectors, runs)
+        if as_json:
+            emit({"file": rel, "control": ctl})
+        else:
+            if ctl["state"] == "CAUGHT":
+                print("negative control: %s %s -> differential vs %s FAIL (%d/%d differ) -> caught ✓" % (
+                    ctl["fn"], ctl["mutation"], ctl["oracle"], ctl["mismatches"], ctl["total"]))
+            else:
+                print("negative control: %s %s" % (ctl["state"], ctl.get("why") or ctl.get("mutation")))
+        if ctl["state"] == "MISSED" and worst != 1:
+            worst = 3
+        elif ctl["state"] == "NOT_RUN" and worst == 0:
+            worst = 2
+        summary.append((rel, ctl["state"]))
+    verdict = {0: "PASS", 1: "FAIL", 2: "NOT_RUN present", 3: "CONTROL MISSED"}[worst]
+    if as_json:
+        emit({"verdict": verdict, "exit": worst, "spark": SPARK, "pins_sha256": PINS_SHA})
+    else:
+        print("\nverify: %s (exit %d). Mac: %s; Spark steps via ssh %s; PINS sha256 %s" % (verdict, worst, host_name(), SPARK, PINS_SHA[:16]))
+    return worst
+
+
+# ---------------------------------------------------------------- other commands
+def parse_value(s):
+    return int(s, 0)
+
+
+def show_result(g):
+    if g[0] == "ok":
+        return str(g[1])
+    if g[0] == "trap":
+        return "trap %s" % (TRAPS.get(g[1], g[1]) if g[1] else "(wasm trap, no Omega code)")
+    return "error " + str(g[1])
+
+
+def run_one(P, fname, args):
+    """Run every form of one function on one argument vector. Returns (fn, values, records)."""
+    if P["om"] is None:
+        raise OmbError("lifter refused %s" % P["path"], 1)
+    fns = [f for f in P["fns"] if f.scalar]
+    f = P["byname"].get(fname) if fname else (fns[0] if fns else None)
+    if f is None:
+        raise OmbError("function %s not in the unit (have: %s)" % (fname, ", ".join(x.name for x in P["fns"])), 64)
+    vals = tuple(parse_value(str(a)) for a in args)
+    if len(vals) != len(f.params):
+        raise OmbError("%s takes %d arguments" % (f.sig(), len(f.params)), 64)
+    for (pn, t), v in zip(f.params, vals):
+        lo, hi = typed_range(t)
+        if not lo <= v <= hi:
+            raise OmbError("%s=%d outside %s range [%d, %d]" % (pn, v, t, lo, hi), 64)
+    vectors = {f.name: [vals]}
+    runs = run_forms(P, vectors)
+    recs = []
+    for form in FORMS:
+        st = form_status(P, form, f.name, runs, vectors)
+        r = runs.get(form)
+        val = ""
+        if r and r["results"] and r["results"].get(f.name):
+            val = show_result(r["results"][f.name][0])
+        why = st.get("why", "")
+        if not why and st.get("bad"):
+            why = st["bad"][0]["detail"]
+        if not why and st.get("excluded"):
+            why = "; ".join(st["excluded_why"])
+        recs.append({"form": form, "where": FORM_WHERE[form], "value": val, "state": st["state"], "why": why,
+                     "ms": round(r["ms"], 1) if r else None})
+    return f, vals, recs
+
+
+def cmd_run(path, fname, args, as_json):
+    P = prepare(path, need_rt=True)
+    f, vals, recs = run_one(P, fname, args)
+    rows = []
+    for rec in recs:
+        if as_json:
+            emit(dict(rec, fn=f.name, args=list(vals)))
+        rows.append([rec["form"], rec["where"], rec["value"], {"PASS": "✓", "FAIL": "✗"}.get(rec["state"], rec["state"]),
+                     "%.1f" % rec["ms"] if rec["ms"] is not None else "", rec["why"][:90]])
+    if not as_json:
+        print("%s%s" % (f.name, vals))
+        table(rows, ["form", "where", "result", "match", "ms", "note"])
+    return 1 if any(r["state"] in ("FAIL", "UNEXPECTED_REFUSAL") for r in recs) else 0
+
+
+def cmd_convert(frm, to, path, as_json):
+    src = open(path, "rb").read()
+    if frm not in ("c", "py", "om") or to not in ("om", "c", "py", "native", "wasm"):
+        raise OmbError("usage: omb convert c|py|om om|c|py|native|wasm FILE", 64)
+    om = src
+    if frm != "om":
+        rc, om, err, ms, where = lift(frm, src, "c")
+        sys.stderr.write(err.decode(errors="replace"))
+        if rc:
+            return rc
+    if to == "om":
+        sys.stdout.buffer.write(om)
+        return 0
+    if to in ("c", "py"):
+        r = toc(om, to)
+    else:
+        r = native(om) if to == "native" else wasm(om)
+    for n, x in r["refused"].items():
+        sys.stderr.write("omb: %s REFUSED by %s: %s\n" % (n, x["tool"], x["msg"]))
+    if r["rc"]:
+        return 1
+    sys.stdout.buffer.write(r["out"])
+    return 1 if r["refused"] else 0
+
+
+def cmd_roundtrip(path, as_json):
+    P = prepare(path)
+    if P["om"] is None:
+        raise OmbError("lifter refused %s" % path, 1)
+    if P["rt"] is None:
+        raise OmbError(lifter_status() or "round trip not run", 2)
+    rc = 0
+    for lang2 in ("c", "py"):
+        e = P["rt"].get(lang2)
+        ok = bool(e and e["identical"])
+        rc = rc or (0 if ok else 1)
+        if as_json:
+            emit({"file": path, "lang": lang2, "identical": ok})
+        else:
+            print("%s: bridge %s (lift %s (bridge %s X)) == bridge %s X: %s" % (path, lang2, lang2, lang2, lang2, "✓ byte-identical" if ok else "✗ differs"))
+    return rc
+
+
+def main(argv):
+    global FRESH
+    as_json = "--json" in argv
+    FRESH = "--fresh" in argv
+    argv = [a for a in argv if a not in ("--json", "--fresh")]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0 if argv else 64
+    op, rest = argv[0], argv[1:]
+    try:
+        if op == "setup":
+            return setup()
+        if op == "pins":
+            print("# local PINS sha256 %s" % PINS_SHA)
+            print(open(os.path.join(KIT, "PINS")).read().rstrip())
+            rc, out, err, ms, _ = remote("pins", b"", cacheable=False)
+            print("# --- Spark (%s) ---" % SPARK)
+            sys.stdout.write(out.decode())
+            print("# lifter on this Mac: %s" % (lifter_status() or "gen/lift.c and gen/lift.py match PINS"))
+            return rc
+        if op == "convert" and len(rest) == 3:
+            return cmd_convert(rest[0], rest[1], rest[2], as_json)
+        if op == "run" and rest:
+            fname = None
+            if "--fn" in rest:
+                i = rest.index("--fn")
+                fname = rest[i + 1]
+                rest = rest[:i] + rest[i + 2:]
+            with mac_lock():
+                return cmd_run(rest[0], fname, rest[1:], as_json)
+        if op == "roundtrip" and len(rest) == 1:
+            return cmd_roundtrip(rest[0], as_json)
+        if op == "verify":
+            quick = "--quick" in rest
+            with mac_lock():
+                return verify([r for r in rest if r != "--quick"], quick, as_json)
+    except OmbError as e:
+        sys.stderr.write("omb: %s\n" % e)
+        return e.code
+    sys.stderr.write(__doc__)
+    return 64
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

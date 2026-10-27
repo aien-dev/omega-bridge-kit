@@ -1,0 +1,9 @@
+fn fpow a long n long to long
+if le n 0
+ret 1
+end
+ret mul a fpow a sub n 1
+end
+fn sq a long to long
+ret mul a a
+end

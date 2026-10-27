@@ -1,0 +1,32 @@
+# Every pin the kit trusts. Read by remote/setup.sh, remote/omb-remote.sh (Spark) and omb (Mac).
+# KEY=value, one per line, no spaces, no quoting. A sha256 that does not match stops the kit.
+
+# aien-dev/omega-bridge: toc (.om -> C / Python), built from source by the source-only bootstrap.
+BRIDGE_REPO=https://github.com/aien-dev/omega-bridge.git
+BRIDGE_SHA=358c505105793f202ad2b0c32a8623b606e029cd
+BOOT_OMC_SHA256=191b776ef98821597c3e30655da6d680a9b66edbc9ceaca3c39c61ea6df098e9
+TOC_OM_SHA256=e691e10d627b5595ee1268efb35222546eea9ba7b12805bb5bd98d565900c2c2
+BRIDGE_BIN_SHA256=db0847423bec99ba66fdd99e75e5e3b795e2a5386e81ca3ed7b4c9c530a5bd4e
+
+# aien-dev/omega-bridge src/native.om (native call ABI v1) at the commit whose C builds on macOS.
+NATIVE_SHA=358c505105793f202ad2b0c32a8623b606e029cd
+NATIVE_OM_SHA256=2c2c53f61d4ab302f1a2092c3c32189335dd53f6cf2b388f47a475f99f2c3940
+
+# Seeded compiler that compiles function-mode units for native.om (aien-spark/omega seed/out/omc).
+OMC734_REPO=https://github.com/aien-spark/omega.git
+OMC734_COMMIT=e17039d9ceeb30e0637ef4145e37afc5821c3773
+OMC734_SHA256=734f0a39319fbfa930bcc62cb30dbf06d47d78e126372b74f5baf478e6126b61
+
+# aien-dev/omega-mv: seeded compiler in IR mode plus seed/wasm/irwasm.om (.om -> IR -> wasm).
+MV_REPO=https://github.com/aien-dev/omega-mv.git
+MV_SHA=e5b32567a7aff3ce594e3254a622a846a6cd190b
+MV_OMC_SHA256=2c82480596bbdc50cda9626866209ef662d5834f278f839ff4ce0250c495029f
+IRWASM_OM_SHA256=8dc7bf602eb882e26a18b9e2dc4cacdd3ad68827215e71874b14c4acb237ccf8
+IRWASM_SHA256=2d235a70c39ac1461a09c41e10e058d962b767ae83893cdcfc693ef6c47182e6
+
+# aien-dev/omega-lift: C/Python -> .om lifter (src/lift.om). gen/lift.c and gen/lift.py are toc output of it.
+LIFT_REPO=https://github.com/aien-dev/omega-lift.git
+LIFT_SHA=PENDING
+LIFT_OM_SHA256=PENDING
+LIFT_C_SHA256=PENDING
+LIFT_PY_SHA256=PENDING

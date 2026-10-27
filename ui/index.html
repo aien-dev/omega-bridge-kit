@@ -1,0 +1,312 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>omega-bridge-kit</title>
+<style>
+:root { color-scheme: light dark; --bg:#f6f6f4; --fg:#1d1d1b; --mut:#6a6a66; --pane:#ffffff; --line:#d8d8d4;
+  --ok:#1f7a3a; --okbg:#e3f3e7; --bad:#a3231a; --badbg:#f8e1df; --na:#6a6a66; --nabg:#ececea;
+  --mac:#2b5aa6; --spark:#8a4b08; --browser:#5b3a99; --mono: ui-monospace, SFMono-Regular, Menlo, monospace; }
+@media (prefers-color-scheme: dark) { :root { --bg:#161615; --fg:#e6e6e2; --mut:#9a9a94; --pane:#1f1f1e; --line:#33332f;
+  --ok:#6fd38c; --okbg:#173621; --bad:#ff8a7f; --badbg:#3e1915; --na:#a0a09a; --nabg:#2a2a28;
+  --mac:#8db4ff; --spark:#f0a65a; --browser:#c3a4ff; } }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system, system-ui, sans-serif; }
+header { padding:12px 18px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px 18px; align-items:baseline; }
+header h1 { font-size:17px; margin:0; }
+header .meta { color:var(--mut); font-size:12px; }
+main { padding:12px 18px 40px; display:grid; gap:12px; }
+.card { background:var(--pane); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+.card > h2, details > summary { font-size:13px; font-weight:600; margin:0 0 6px; cursor:default; }
+details > summary { cursor:pointer; }
+.bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+button, select, input[type=text] { font:inherit; font-size:13px; padding:4px 9px; border:1px solid var(--line);
+  background:var(--bg); color:var(--fg); border-radius:6px; }
+button { cursor:pointer; } button:hover { border-color:var(--mut); } button.primary { font-weight:600; }
+button:disabled { opacity:.5; cursor:wait; }
+input[type=text] { font-family:var(--mono); width:220px; }
+.panes { display:grid; grid-template-columns:repeat(auto-fit, minmax(360px, 1fr)); gap:12px; }
+.pane { background:var(--pane); border:1px solid var(--line); border-radius:8px; display:flex; flex-direction:column; min-height:260px; }
+.pane .hd { display:flex; gap:8px; align-items:center; padding:6px 10px; border-bottom:1px solid var(--line); font-weight:600; font-size:13px; }
+.pane .hd .st { margin-left:auto; font-weight:400; color:var(--mut); font-size:12px; }
+textarea, pre.code { font:12px/1.4 var(--mono); margin:0; padding:8px 10px; border:0; background:transparent; color:var(--fg);
+  width:100%; flex:1; resize:vertical; white-space:pre; overflow:auto; max-height:420px; min-height:200px; }
+pre.code { white-space:pre; }
+.badge { font-size:11px; font-weight:600; padding:1px 6px; border-radius:10px; border:1px solid currentColor; white-space:nowrap; }
+.MAC { color:var(--mac); } .SPARK { color:var(--spark); } .BROWSER { color:var(--browser); } .HOST { color:var(--mac); }
+.ok { color:var(--ok); background:var(--okbg); } .bad { color:var(--bad); background:var(--badbg); } .na { color:var(--na); background:var(--nabg); }
+table { border-collapse:collapse; width:100%; font-size:12.5px; }
+th, td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+th { color:var(--mut); font-weight:600; }
+td.v { font-family:var(--mono); }
+.state { font-weight:600; padding:1px 6px; border-radius:4px; }
+#match { font-size:14px; font-weight:700; padding:3px 10px; border-radius:6px; }
+#log { font:11.5px/1.45 var(--mono); max-height:260px; overflow:auto; white-space:pre-wrap; margin:0; }
+.mut { color:var(--mut); } .small { font-size:12px; }
+kbd { font:11px var(--mono); border:1px solid var(--line); border-radius:3px; padding:0 4px; }
+.err { color:var(--bad); white-space:pre-wrap; font-family:var(--mono); font-size:12px; }
+ul.tight { margin:4px 0; padding-left:18px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>omega-bridge-kit</h1>
+  <span class="meta" id="meta">loading…</span>
+</header>
+<main>
+
+<section class="card">
+  <details id="realcard" open>
+    <summary>What's real / what's not</summary>
+    <p class="small mut">Same table as <code>WHATS-REAL.md</code>. TOOL = a program did it; AGENT = written or ported by an AI agent by hand, not by a tool.</p>
+    <table id="real"></table>
+  </details>
+</section>
+
+<section class="card">
+  <div class="bar">
+    <select id="file" title="source file"></select>
+    <span class="mut small">lang</span>
+    <select id="lang"><option value="c">C</option><option value="py">Python</option><option value="om">.om</option></select>
+    <span class="mut small">|</span>
+    <button data-act="lift">Lift → .om</button>
+    <button data-act="c">.om → C</button>
+    <button data-act="py">.om → Python</button>
+    <button data-act="native">.om → Native</button>
+    <button data-act="wasm">.om → WASM</button>
+    <button data-act="liftc">C → .om</button>
+    <button data-act="liftpy">Python → .om</button>
+  </div>
+  <div class="bar" style="margin-top:8px">
+    <span class="mut small">function</span><select id="fn"></select>
+    <span class="mut small">args</span><input type="text" id="args" value="48 18" title="space separated integers">
+    <button class="primary" id="runall">Run all <kbd>⌘/Ctrl ⏎</kbd></button>
+    <label class="small mut"><input type="checkbox" id="fresh"> --fresh (no cache)</label>
+    <span id="busy" class="mut small"></span>
+  </div>
+</section>
+
+<section class="panes">
+  <div class="pane"><div class="hd">Original <span class="badge MAC" id="b-orig">MAC</span><span class="st" id="s-orig"></span></div>
+    <textarea id="orig" spellcheck="false"></textarea></div>
+  <div class="pane"><div class="hd">.om <span class="badge" id="b-om"></span><span class="st" id="s-om"></span></div>
+    <textarea id="om" spellcheck="false"></textarea></div>
+  <div class="pane"><div class="hd">C (toc) <span class="badge SPARK">SPARK via ssh</span><span class="st" id="s-c"></span></div>
+    <pre class="code" id="c"></pre></div>
+  <div class="pane"><div class="hd">Python (toc) <span class="badge SPARK">SPARK via ssh</span><span class="st" id="s-py"></span></div>
+    <pre class="code" id="py"></pre></div>
+  <div class="pane"><div class="hd">Native (Omega AArch64 code) <span class="badge SPARK">SPARK via ssh</span><span class="st" id="s-native"></span></div>
+    <div style="padding:8px 10px; overflow:auto; max-height:420px">
+      <div id="nhex" class="small"></div>
+      <details><summary class="small">binding C (built with clang on the Mac)</summary><pre class="code" id="native"></pre></details>
+    </div></div>
+  <div class="pane"><div class="hd">WASM <span class="badge SPARK">SPARK via ssh</span><span class="st" id="s-wasm"></span></div>
+    <pre class="code" id="wasm"></pre></div>
+</section>
+
+<section class="card">
+  <h2>Results <span id="match" class="na">not run</span> <span class="mut small" id="rhead"></span></h2>
+  <table id="results"><thead><tr><th>form</th><th>where</th><th>result</th><th>match</th><th>ms</th><th>note</th></tr></thead><tbody></tbody></table>
+  <div id="refusals" class="small"></div>
+</section>
+
+<section class="card">
+  <h2>Paste your own</h2>
+  <div class="bar"><select id="plang"><option value="c">C</option><option value="py">Python</option></select>
+    <button id="plift">Lift it</button><button id="puse">Load into the panes</button>
+    <span class="mut small">Lifted functions and skipped ones (with the lifter's reason) appear below.</span></div>
+  <textarea id="paste" spellcheck="false" style="min-height:140px; margin-top:6px; border:1px solid var(--line); border-radius:6px"
+    placeholder="int add3(int a, int b, int c) { return a + b + c; }"></textarea>
+  <div id="pout" class="small"></div>
+</section>
+
+<section class="card"><details id="pickcard"><summary>Picks (PICK.md: seed, filter, candidates, lifter verdicts as-is)</summary>
+  <pre class="code" id="pick" style="max-height:360px"></pre></details></section>
+
+<section class="card">
+  <h2>Command log <span class="mut small">(every command this page caused, local and over ssh)</span></h2>
+  <pre id="log"></pre>
+</section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let INFO = null, WASM = null, HERE = "MAC";
+
+function badgeClass(where) { return where.startsWith("SPARK") ? "SPARK" : where.startsWith("BROWSER") ? "BROWSER" : "MAC"; }
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function stateClass(s) { return s === "PASS" ? "ok" : (s === "FAIL" || s === "UNEXPECTED_REFUSAL") ? "bad" : "na"; }
+function stateText(s) { return s === "PASS" ? "✓ match" : s === "FAIL" ? "✗ differs" : s; }
+
+function log(lines) {
+  const el = $("log");
+  for (const e of lines) {
+    const t = new Date(e.t * 1000).toLocaleTimeString();
+    el.textContent += `${t} [${e.where}] $ ${e.cmd}  (rc=${e.rc}, ${Math.round(e.ms)} ms${e.note ? ", " + e.note : ""})\n`;
+  }
+  el.scrollTop = el.scrollHeight;
+}
+function logLocal(cmd, note) { log([{t: Date.now() / 1000, where: "BROWSER", cmd, rc: 0, ms: 0, note: note || ""}]); }
+
+async function api(path, body) {
+  $("busy").textContent = "working… " + path;
+  document.querySelectorAll("button").forEach((b) => b.disabled = true);
+  try {
+    const r = await fetch(path, body ? {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(Object.assign({fresh: $("fresh").checked}, body))} : {});
+    const j = await r.json();
+    if (j.log) log(j.log);
+    return j;
+  } finally {
+    $("busy").textContent = "";
+    document.querySelectorAll("button").forEach((b) => b.disabled = false);
+  }
+}
+
+function refusedHtml(ref) {
+  const names = Object.keys(ref || {});
+  if (!names.length) return "";
+  return "<ul class='tight'>" + names.map((n) => `<li><b>${esc(n)}</b>: ${ref[n].expected ? "REFUSED by compiler (expected)" : "<span class='bad state'>UNEXPECTED REFUSAL</span>"} — ${esc(ref[n].tool)}: <code>${esc(ref[n].msg)}</code>${ref[n].expected ? " <span class='mut'>[" + esc(ref[n].expected) + "]</span>" : ""}</li>`).join("") + "</ul>";
+}
+
+function setFns(names) {
+  const cur = $("fn").value;
+  $("fn").innerHTML = names.map((n) => `<option>${esc(n)}</option>`).join("");
+  if (names.includes(cur)) $("fn").value = cur;
+}
+function omFns(text) {
+  const out = [];
+  for (const line of text.split("\n")) { const m = /^fn\s+(\w+)/.exec(line); if (m && m[1] !== "main") out.push(m[1]); }
+  return out;
+}
+
+async function loadInfo() {
+  INFO = await api("/api/info");
+  HERE = INFO.here;
+  $("meta").textContent = `this machine: ${INFO.here} · Spark: ssh ${INFO.spark} · PINS sha256 ${INFO.pins_sha.slice(0, 16)} · omega-bridge ${(INFO.pins.BRIDGE_SHA || "").slice(0, 10)} · lifter: ${INFO.lifter}`;
+  $("b-orig").textContent = HERE; $("b-orig").className = "badge " + badgeClass(HERE);
+  $("b-om").textContent = HERE + " (lifter)"; $("b-om").className = "badge " + badgeClass(HERE);
+  const wr = INFO.whats_real;
+  $("real").innerHTML = "<thead><tr>" + wr.head.map((h) => `<th>${esc(h)}</th>`).join("") + "</tr></thead><tbody>" +
+    wr.rows.map((r) => "<tr>" + r.map((c) => `<td>${esc(c).replace(/`([^`]+)`/g, "<code>$1</code>")}</td>`).join("") + "</tr>").join("") + "</tbody>";
+  $("file").innerHTML = INFO.files.map((f) => `<option value="${esc(f.path)}">${esc(f.path)}</option>`).join("");
+  $("pick").textContent = INFO.pick_md || "picks/PICK.md not present yet";
+  if (INFO.files.length) await loadFile(INFO.files[0].path);
+}
+
+async function loadFile(path) {
+  const j = await api("/api/file?path=" + encodeURIComponent(path));
+  if (j.error) return;
+  $("orig").value = j.src; $("lang").value = j.lang;
+  for (const id of ["c", "py", "native", "wasm"]) { $(id).textContent = ""; $("s-" + id).textContent = ""; }
+  $("nhex").innerHTML = ""; WASM = null;
+  if (j.lang === "om") { $("om").value = j.src; $("s-om").textContent = "input (.om source)"; setFns(omFns(j.src)); }
+  else { $("om").value = ""; $("s-om").textContent = "press Lift → .om"; setFns([]); }
+}
+
+function showLift(j, target) {
+  if (j.error) { target.innerHTML = `<div class="err">${esc(j.error)}</div>`; return; }
+  let h = `<p>lifter rc=${j.rc} · ${j.ms} ms on ${esc(j.where)} · python3 lift.py gives the same output: ${j.py_agrees ? "✓" : "✗"}</p>`;
+  if (j.lifted.length) h += "<b>Lifted</b><ul class='tight'>" + j.lifted.map((f) => `<li><code>${esc(f.orig)}</code> → <code>${esc(f.sig)}</code></li>`).join("") + "</ul>";
+  if (j.skips.length) h += "<b>UNSUPPORTED (skipped)</b><ul class='tight'>" + j.skips.map((s) => `<li><code>${esc(s.name)}</code> line ${s.line}: ${esc(s.reason)}</li>`).join("") + "</ul>";
+  if (j.fatal.length) h += "<b>Refused</b><ul class='tight'>" + j.fatal.map((s) => `<li>line ${s.line}: ${esc(s.reason)}</li>`).join("") + "</ul>";
+  if (j.other.length) h += "<pre class='err'>" + esc(j.other.join("\n")) + "</pre>";
+  target.innerHTML = h;
+}
+
+async function doLift(lang, src) {
+  const j = await api("/api/lift", {lang, src});
+  if (!j.error && j.rc === 0) { $("om").value = j.om; setFns(j.lifted.map((f) => f.name)); }
+  $("s-om").textContent = j.error ? "error" : j.rc === 0 ? `lifted in ${j.ms} ms, ${j.skips.length} skipped` : "lifter refused";
+  showLift(j, $("refusals"));
+  return j;
+}
+
+async function convert(to) {
+  const j = await api("/api/convert", {to, om: $("om").value});
+  const st = $("s-" + to);
+  if (j.error) { $(to).textContent = j.error; st.textContent = "error"; return j; }
+  const nref = Object.keys(j.refused).length;
+  st.textContent = `${j.ms} ms · ${j.exported.length} exported${nref ? ", " + nref + " refused" : ""}`;
+  if (to === "c" || to === "py") $(to).textContent = j.out || j.err;
+  if (to === "native") {
+    $("native").textContent = j.out;
+    $("nhex").innerHTML = Object.keys(j.hex).map((n) => `<div><b>omega_${esc(n)}</b> <span class="mut">${j.hex[n].length / 2} bytes of Omega code</span><pre class="code" style="min-height:0">${esc(j.hex[n].match(/.{1,64}/g).join("\n"))}</pre></div>`).join("") + refusedHtml(j.refused);
+  }
+  if (to === "wasm") {
+    $("wasm").textContent = `${j.size} bytes, exports: ${j.exported.join(", ")}\n\n` + (j.hex.match(/.{1,64}/g) || []).join("\n");
+    WASM = j.size ? {bytes: Uint8Array.from(atob(j.b64), (c) => c.charCodeAt(0)), sigs: j.sigs, exported: j.exported} : null;
+  }
+  if (nref && to !== "native") $("refusals").innerHTML += `<b>${to === "c" ? "C" : to === "py" ? "Python" : "WASM"}</b>` + refusedHtml(j.refused);
+  return j;
+}
+
+const W = {bool:1,uchar:8,ushort:16,uint:32,ulong:64,byte:8,short:16,int:32,long:64};
+const SIGNED = {byte:1,short:1,int:1,long:1};
+async function browserWasm(fn, args) {
+  if (!WASM) return {state: "NOT_RUN", why: "no wasm module (convert .om → WASM first)"};
+  if (!WASM.exported.includes(fn)) return {state: "REFUSED", why: "function not in the wasm module (see refusals)"};
+  const sig = WASM.sigs[fn];
+  const t0 = performance.now();
+  try {
+    const {instance} = await WebAssembly.instantiate(WASM.bytes, {});
+    const a = sig.params.map((t, i) => W[t] === 64 ? BigInt(args[i]) : Number(BigInt.asIntN(32, BigInt(args[i]))));
+    let r = instance.exports[fn](...a);
+    if (sig.ret === "void") r = 0n;
+    else r = SIGNED[sig.ret] ? BigInt.asIntN(W[sig.ret], BigInt(r)) : BigInt.asUintN(W[sig.ret], BigInt(r));
+    logLocal(`WebAssembly.instantiate(${WASM.bytes.length} bytes); exports.${fn}(${args.join(", ")})`, `${(performance.now() - t0).toFixed(1)} ms in this browser`);
+    return {value: r.toString(), ms: performance.now() - t0};
+  } catch (e) {
+    logLocal(`WebAssembly exports.${fn}(${args.join(", ")})`, "trapped: " + e.message);
+    return {value: e instanceof WebAssembly.RuntimeError ? "trap (wasm trap, no Omega code)" : "error " + e.message, ms: performance.now() - t0};
+  }
+}
+
+async function runAll() {
+  const lang = $("lang").value;
+  const args = $("args").value.trim().split(/\s+/).filter(Boolean);
+  $("refusals").innerHTML = "";
+  if (lang !== "om") { const l = await doLift(lang, $("orig").value); if (l.error || l.rc) return; }
+  else if (!$("om").value.trim()) $("om").value = $("orig").value;   // an edited .om pane wins
+  for (const to of ["c", "py", "native", "wasm"]) await convert(to);
+  const j = await api("/api/runall", {lang, src: $("orig").value, om: $("om").value, fn: $("fn").value, args});
+  const tb = $("results").querySelector("tbody");
+  if (j.error) { tb.innerHTML = `<tr><td colspan=6 class="err">${esc(j.error)}</td></tr>`; $("match").className = "bad"; $("match").textContent = "error"; return; }
+  setFns(j.fns); $("fn").value = j.fn;
+  const rows = j.results.slice();
+  const ref = rows.find((r) => r.form === "OM>C" && r.value) || rows.find((r) => r.form === "OM>PY" && r.value);
+  const b = await browserWasm(j.fn, j.args);
+  if (b.value !== undefined) {
+    const same = ref && (ref.value === b.value || (ref.value.startsWith("trap") && b.value.startsWith("trap")));
+    rows.push({form: "WASM", where: "BROWSER", value: b.value, state: ref ? (same ? "PASS" : "FAIL") : "NOT_RUN",
+      ms: Math.round(b.ms * 10) / 10, why: ref ? "compared with " + ref.form : "no Omega reference value"});
+  } else rows.push({form: "WASM", where: "BROWSER", value: "", state: b.state, ms: null, why: b.why});
+  tb.innerHTML = rows.map((r) => `<tr><td>${esc(r.form)}</td><td><span class="badge ${badgeClass(r.where)}">${esc(r.where)}</span></td><td class="v">${esc(r.value)}</td><td><span class="state ${stateClass(r.state)}">${esc(stateText(r.state))}</span></td><td>${r.ms == null ? "" : r.ms}</td><td class="small">${esc(r.why || "")}</td></tr>`).join("");
+  const bad = rows.some((r) => r.state === "FAIL" || r.state === "UNEXPECTED_REFUSAL");
+  const pass = rows.filter((r) => r.state === "PASS").length;
+  $("match").className = bad ? "bad" : pass ? "ok" : "na";
+  $("match").textContent = bad ? "MISMATCH" : pass ? `all ${pass} compared forms agree` : "nothing compared";
+  const rt = Object.entries(j.roundtrip || {}).map(([k, v]) => `round trip ${k}: ${v ? "byte-identical ✓" : "differs ✗"}`).join(" · ");
+  $("rhead").textContent = `${j.sig} on (${j.args.join(", ")})` + (rt ? " · " + rt : "");
+  if (j.skips && j.skips.length) $("refusals").innerHTML += "<b>UNSUPPORTED (skipped by the lifter)</b><ul class='tight'>" + j.skips.map((s) => `<li><code>${esc(s.name)}</code> line ${s.line}: ${esc(s.reason)}</li>`).join("") + "</ul>";
+}
+
+document.querySelectorAll("button[data-act]").forEach((btn) => btn.addEventListener("click", async () => {
+  const a = btn.dataset.act;
+  if (a === "lift") return doLift($("lang").value === "py" ? "py" : "c", $("orig").value);
+  if (a === "liftc") return doLift("c", $("c").textContent);
+  if (a === "liftpy") return doLift("py", $("py").textContent);
+  return convert(a);
+}));
+$("runall").addEventListener("click", runAll);
+$("file").addEventListener("change", (e) => loadFile(e.target.value));
+document.addEventListener("keydown", (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); runAll(); } });
+$("plift").addEventListener("click", async () => showLift(await api("/api/lift", {lang: $("plang").value, src: $("paste").value}), $("pout")));
+$("puse").addEventListener("click", () => { $("orig").value = $("paste").value; $("lang").value = $("plang").value; $("om").value = ""; setFns([]); });
+loadInfo();
+</script>
+</body>
+</html>

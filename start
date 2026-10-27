@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Start the kit's local UI on 127.0.0.1, open it in the default browser, stop on Ctrl-C.
+# Usage: ./start [PORT]   (default 8765; a random free port when 8765 is taken)
+set -eu
+cd "$(dirname "$0")"
+port=${1:-8765}
+fifo=$(mktemp -u "${TMPDIR:-/tmp}/omb-ui.XXXXXX")
+mkfifo "$fifo"
+python3 ui/server.py "$port" >"$fifo" &
+pid=$!
+trap 'kill "$pid" 2>/dev/null; rm -f "$fifo"' EXIT INT TERM
+read -r url <"$fifo"
+rm -f "$fifo"
+echo "omega-bridge-kit UI: $url   (Ctrl-C stops it)"
+if [ -z "${OMB_NO_OPEN:-}" ] && command -v open >/dev/null 2>&1; then open "$url"; fi
+wait "$pid"

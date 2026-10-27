@@ -1,0 +1,11 @@
+fn gcd a long b long to long
+while ne b 0
+t = rem a b
+a = b
+b = t
+end
+ret a
+end
+fn lcm a long b long to long
+ret mul div a gcd a b b
+end
