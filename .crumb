@@ -3,14 +3,14 @@
     "generated": {
       "children": [],
       "children_root": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "compiled_at": "2026-10-27T12:01:48Z",
+      "compiled_at": "2026-10-27T12:04:44Z",
       "compiler": "crumb-compile/1",
-      "digest": "sha256:8fa15796f9ad75ee6ce14ace5c7946ba8c9a9d922380028d0e8c77927ff45254",
+      "digest": "sha256:e998b439588e383f967ddf17191245799b7f64dc9fc01880b8bddb5d51a1b2ec",
       "evidence_files": 0,
       "evidence_root": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "files": 18,
-      "generated_at_commit": "6083d27e0d312b9637a0c89ef42eb6d9d0d02251",
-      "source_tree": "sha256:addc032e74956364d5f7152ca29017e6c8f6c2d9f1f16d92070935d16a8c3494"
+      "files": 19,
+      "generated_at_commit": "e925e3c48abec8a1db462f92e1bad568d5963f62",
+      "source_tree": "sha256:203fa85639f562092d27820810e79eaed04adf3286850593e86ff58028a7c13c"
     },
     "parent": "aien-dev/omega-bridge@358c505105793f202ad2b0c32a8623b606e029cd",
     "parent_note": "Parent is recorded under extensions because the crumb schema has additionalProperties:false at top level."
