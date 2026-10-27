@@ -194,7 +194,13 @@ async function loadInfo() {
     wr.rows.map((r) => "<tr>" + r.map((c) => `<td>${esc(c).replace(/`([^`]+)`/g, "<code>$1</code>")}</td>`).join("") + "</tr>").join("") + "</tbody>";
   $("file").innerHTML = INFO.files.map((f) => `<option value="${esc(f.path)}">${esc(f.path)}</option>`).join("");
   $("pick").textContent = INFO.pick_md || "picks/PICK.md not present yet";
-  if (INFO.files.length) await loadFile(INFO.files[0].path);
+  // Deep link: #file=samples/gcd.om&fn=gcd&args=48 18&run=1 opens that file and optionally runs it.
+  const h = new URLSearchParams(location.hash.slice(1));
+  const want = INFO.files.some((f) => f.path === h.get("file")) ? h.get("file") : INFO.files.length ? INFO.files[0].path : "";
+  if (want) await loadFile(want);
+  if (h.get("fn") && [...$("fn").options].some((o) => o.value === h.get("fn"))) $("fn").value = h.get("fn");
+  if (h.get("args") !== null) $("args").value = h.get("args");
+  if (h.get("run") === "1") await runAll();
 }
 
 async function loadFile(path) {
