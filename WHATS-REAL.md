@@ -10,7 +10,7 @@ The UI shows this same table (its "What's real / what's not" card reads this fil
 |---|---|---|---|
 | C / Python → .om (the lifter, `src/lift.om` in aien-dev/omega-lift) | MAC: clang-built `gen/lift.c`, cross-checked by python3 `gen/lift.py` and by the Spark build | TOOL (the lifter is Omega written by an agent; each lift is done by the tool) | NOT_RUN until the lifter is pinned in `PINS` |
 | .om → C, .om → Python (`toc`, aien-dev/omega-bridge) | SPARK via ssh (`remote/omb-remote.sh toc-c` / `toc-py`) | TOOL | EXERCISED on the samples |
-| .om → native AArch64 code inside a C binding (`src/native.om` + seeded omc 734f0a39) | SPARK via ssh (`native-c`); the binding C is then compiled by clang on the MAC | TOOL | Linux AArch64 EXERCISED; macOS needs the native-darwin pin (NOT_RUN until then) |
+| .om → native AArch64 code inside a C binding (`src/native.om` at omega-bridge `feat/native-darwin` 7500207, draft PR #27, not merged; seeded omc 734f0a39) | SPARK via ssh (`native-c`); the binding C is then compiled by clang on the MAC | TOOL | EXERCISED on the Mac (Mach-O, the code bytes run as compiled) and on Linux AArch64 |
 | .om → WebAssembly (omega-mv omc IR mode + `irwasm`) | SPARK via ssh (`wasm`) | TOOL | EXERCISED where the unit fits IR mode |
 | Running the WebAssembly | MAC (`jsc`, JavaScriptCore) and BROWSER (WebAssembly in the page) | TOOL | EXERCISED on the Mac |
 | Running toc C and native C | MAC (Apple clang) | TOOL | EXERCISED |
